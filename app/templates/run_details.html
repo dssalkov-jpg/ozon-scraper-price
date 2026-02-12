@@ -1,0 +1,72 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>📊 Run #{{run.id if run else '?'}} — Результаты</h2>
+
+{% if run %}
+<div class="card">
+  <p>
+    <strong>Статус:</strong> <span class="status status-{{run.status}}">{{run.status}}</span><br>
+    <strong>Регион:</strong> {{run.region.name if run.region else '—'}}<br>
+    <strong>Начало:</strong> {{run.started_at.strftime('%Y-%m-%d %H:%M:%S') if run.started_at else '—'}}<br>
+    <strong>Конец:</strong> {{run.finished_at.strftime('%Y-%m-%d %H:%M:%S') if run.finished_at else '—'}}<br>
+    <strong>Результат:</strong> {{run.success_count}} успешно / {{run.fail_count}} ошибок из {{run.total_targets}}
+  </p>
+  {% if run.error %}
+  <p class="error"><strong>Ошибка:</strong> {{run.error}}</p>
+  {% endif %}
+  <a href="/runs/{{run.id}}/json" target="_blank" class="btn btn-secondary">📥 Скачать JSON</a>
+</div>
+{% endif %}
+
+{% if points %}
+<table>
+  <thead>
+    <tr>
+      <th>Товар</th>
+      <th>Цена</th>
+      <th>Старая цена</th>
+      <th>С картой</th>
+      <th>В наличии</th>
+      <th>Ошибка</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for p in points %}
+    <tr>
+      <td>
+        <strong>{{p.target.name or 'Без названия'}}</strong><br>
+        <a href="{{p.target.url}}" target="_blank" class="muted url-cell">{{p.target.url[:60]}}...</a>
+      </td>
+      <td>
+        {% if p.price %}
+          <span class="price">{{ "%.2f"|format(p.price / 100) }} ₽</span>
+        {% else %}
+          <span class="muted">—</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if p.old_price %}
+          <span class="price-old">{{ "%.2f"|format(p.old_price / 100) }} ₽</span>
+        {% else %}
+          —
+        {% endif %}
+      </td>
+      <td>
+        {% if p.card_price %}
+          {{ "%.2f"|format(p.card_price / 100) }} ₽
+        {% else %}
+          —
+        {% endif %}
+      </td>
+      <td>{{ "✅" if p.in_stock else "❌" }}</td>
+      <td class="error">{{p.error or ''}}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="card muted">Нет данных</div>
+{% endif %}
+
+<p style="margin-top:20px"><a href="/runs">← Назад к списку</a></p>
+{% endblock %}

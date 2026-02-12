@@ -1,0 +1,70 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>🚀 Runs (запуски сбора цен)</h2>
+
+<div class="card">
+  <h3>Запустить сбор</h3>
+  {% if regions %}
+  <form method="post" action="/runs/start">
+    <div class="form-group">
+      <label>Профиль региона</label>
+      <select name="region_profile_id">
+        {% for r in regions %}
+          <option value="{{r.id}}">{{r.name}}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <button type="submit">▶️ Запустить сейчас</button>
+  </form>
+  <p class="muted" style="margin-top:12px">
+    ⏰ Автозапуск ежедневно в {{"%02d"|format(1)}}:00 UTC
+  </p>
+  {% else %}
+  <p class="muted">Сначала создай профиль региона во вкладке Regions</p>
+  {% endif %}
+</div>
+
+{% if runs %}
+<table>
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Статус</th>
+      <th>Регион</th>
+      <th>Прогресс</th>
+      <th>Начало</th>
+      <th>Конец</th>
+      <th>Ошибка</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for run in runs %}
+    <tr>
+      <td><a href="/runs/{{run.id}}">{{run.id}}</a></td>
+      <td>
+        <span class="status status-{{run.status}}">{{run.status}}</span>
+      </td>
+      <td>{{run.region.name if run.region else '—'}}</td>
+      <td>
+        {% if run.total_targets > 0 %}
+          <span class="price">{{run.success_count}}</span> / {{run.total_targets}}
+          {% if run.fail_count > 0 %}
+            <span class="error">({{run.fail_count}} ошибок)</span>
+          {% endif %}
+        {% else %}
+          —
+        {% endif %}
+      </td>
+      <td class="muted">{{run.started_at.strftime('%m-%d %H:%M') if run.started_at else '—'}}</td>
+      <td class="muted">{{run.finished_at.strftime('%m-%d %H:%M') if run.finished_at else '—'}}</td>
+      <td class="error" style="max-width:200px; word-break:break-word">
+        {{run.error[:100] if run.error else ''}}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="card muted">Нет запусков</div>
+{% endif %}
+{% endblock %}

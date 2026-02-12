@@ -1,0 +1,62 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>📋 Targets (URLs для мониторинга)</h2>
+
+<div class="card">
+  <h3>Добавить товар</h3>
+  <form method="post" action="/targets/add">
+    <div class="form-group">
+      <label>URL товара на Ozon</label>
+      <input name="url" placeholder="https://www.ozon.ru/product/..." required/>
+    </div>
+    <div class="form-group">
+      <label>Название (для себя)</label>
+      <input name="name" placeholder="Конкурент А - Товар X"/>
+    </div>
+    <button type="submit">➕ Добавить</button>
+  </form>
+</div>
+
+{% if targets %}
+<table>
+  <thead>
+    <tr>
+      <th style="width:50px">ID</th>
+      <th style="width:60px">Активен</th>
+      <th style="width:200px">Название</th>
+      <th>URL</th>
+      <th style="width:180px">Действия</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for t in targets %}
+    <tr>
+      <td>{{t.id}}</td>
+      <td>{{ "✅" if t.enabled else "❌" }}</td>
+      <td>{{t.name or "—"}}</td>
+      <td class="url-cell">
+        <a href="{{t.url}}" target="_blank">{{t.url}}</a>
+      </td>
+      <td>
+        <form method="post" action="/targets/toggle" style="display:inline">
+          <input type="hidden" name="target_id" value="{{t.id}}"/>
+          <button type="submit" class="btn-secondary" style="padding:6px 12px; font-size:12px">
+            {{ "Выкл" if t.enabled else "Вкл" }}
+          </button>
+        </form>
+        <form method="post" action="/targets/delete" style="display:inline" 
+              onsubmit="return confirm('Удалить?')">
+          <input type="hidden" name="target_id" value="{{t.id}}"/>
+          <button type="submit" class="btn-danger" style="padding:6px 12px; font-size:12px">
+            🗑
+          </button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="card muted">Нет добавленных товаров</div>
+{% endif %}
+{% endblock %}

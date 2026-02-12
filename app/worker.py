@@ -1,0 +1,341 @@
+"""
+Улучшенный worker для парсинга цен с Ozon.
+- Playwright Stealth для обхода детекции
+- Реальный браузер через Xvfb (не headless)
+- Человекоподобное поведение
+- Retry с exponential backoff
+- Точное извлечение цен из JSON API
+"""
+
+import re
+import json
+import random
+import time
+import os
+import logging
+from datetime import datetime
+from typing import Optional
+
+from playwright.sync_api import sync_playwright, Page, BrowserContext
+from playwright_stealth import stealth_sync
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from fake_useragent import UserAgent
+from sqlalchemy.orm import Session
+
+from .models import Target, PricePoint
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Настройки задержек
+MIN_DELAY = int(os.getenv("MIN_DELAY_SECONDS", "45"))
+MAX_DELAY = int(os.getenv("MAX_DELAY_SECONDS", "120"))
+PROXY_URL = os.getenv("PROXY_URL", "")
+
+ua = UserAgent(browsers=["chrome"])
+
+
+def random_delay(min_sec: float = None, max_sec: float = None):
+    """Случайная задержка между действиями"""
+    min_sec = min_sec or MIN_DELAY
+    max_sec = max_sec or MAX_DELAY
+    delay = random.uniform(min_sec, max_sec)
+    logger.info(f"Ждём {delay:.1f} сек...")
+    time.sleep(delay)
+
+
+def human_scroll(page: Page):
+    """Имитация человеческого скролла"""
+    for _ in range(random.randint(2, 4)):
+        scroll_amount = random.randint(200, 500)
+        page.mouse.wheel(0, scroll_amount)
+        time.sleep(random.uniform(0.3, 0.8))
+
+
+def extract_prices_from_json(json_str: str) -> dict:
+    """
+    Извлекает цены из JSON ответа Ozon API.
+    Ищет структуры вида: price, finalPrice, cardPrice, originalPrice
+    """
+    result = {"price": None, "old_price": None, "card_price": None}
+    
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError:
+        return result
+    
+    def search_prices(obj, depth=0):
+        if depth > 15 or result["price"] is not None:
+            return
+        
+        if isinstance(obj, dict):
+            # Ищем типичные структуры цен Ozon
+            for key in ["price", "finalPrice", "salePrice", "minPrice"]:
+                if key in obj and result["price"] is None:
+                    val = obj[key]
+                    if isinstance(val, (int, float)) and val > 0:
+                        result["price"] = int(val * 100) if val < 1000000 else int(val)
+                    elif isinstance(val, str):
+                        cleaned = re.sub(r"[^\d]", "", val)
+                        if cleaned:
+                            result["price"] = int(cleaned) * 100
+            
+            for key in ["originalPrice", "basePrice", "oldPrice"]:
+                if key in obj and result["old_price"] is None:
+                    val = obj[key]
+                    if isinstance(val, (int, float)) and val > 0:
+                        result["old_price"] = int(val * 100) if val < 1000000 else int(val)
+                    elif isinstance(val, str):
+                        cleaned = re.sub(r"[^\d]", "", val)
+                        if cleaned:
+                            result["old_price"] = int(cleaned) * 100
+            
+            for key in ["cardPrice", "ozonCardPrice"]:
+                if key in obj and result["card_price"] is None:
+                    val = obj[key]
+                    if isinstance(val, (int, float)) and val > 0:
+                        result["card_price"] = int(val * 100) if val < 1000000 else int(val)
+            
+            for v in obj.values():
+                search_prices(v, depth + 1)
+        
+        elif isinstance(obj, list):
+            for item in obj[:10]:  # Ограничиваем глубину
+                search_prices(item, depth + 1)
+    
+    search_prices(data)
+    return result
+
+
+def extract_price_from_dom(page: Page) -> dict:
+    """Fallback: извлечение цены из DOM"""
+    result = {"price": None, "old_price": None, "card_price": None, "in_stock": True}
+    
+    try:
+        # Проверяем наличие товара
+        out_of_stock_selectors = [
+            "text=Нет в наличии",
+            "text=Товар закончился",
+            "[data-widget='webOutOfStock']"
+        ]
+        for sel in out_of_stock_selectors:
+            if page.locator(sel).count() > 0:
+                result["in_stock"] = False
+                return result
+        
+        # Ищем цену в типичных местах
+        price_selectors = [
+            "[data-widget='webPrice'] span:has-text('₽')",
+            "[data-widget='webSale'] span:has-text('₽')",
+            ".price-block span:has-text('₽')",
+        ]
+        
+        for sel in price_selectors:
+            elements = page.locator(sel).all()
+            for el in elements[:3]:
+                text = el.inner_text()
+                # Убираем все кроме цифр
+                cleaned = re.sub(r"[^\d]", "", text)
+                if cleaned and len(cleaned) >= 2:
+                    price_val = int(cleaned) * 100  # в копейки
+                    if result["price"] is None:
+                        result["price"] = price_val
+                    elif price_val > result["price"]:
+                        result["old_price"] = price_val
+                    break
+            if result["price"]:
+                break
+    
+    except Exception as e:
+        logger.warning(f"DOM extraction error: {e}")
+    
+    return result
+
+
+class OzonScraper:
+    def __init__(self, storage_path: str):
+        self.storage_path = storage_path
+        self.context: Optional[BrowserContext] = None
+        self.captured_responses: list = []
+    
+    def _on_response(self, response):
+        """Перехват JSON ответов"""
+        try:
+            ct = response.headers.get("content-type", "")
+            url = response.url
+            
+            # Ловим API ответы с данными о товаре
+            if "application/json" in ct and any(x in url for x in [
+                "/api/", "/v1/", "/v2/", "state.json", "webPrice", "webSale"
+            ]):
+                body = response.text()
+                if '"price"' in body or '"finalPrice"' in body or '"Price"' in body:
+                    self.captured_responses.append({
+                        "url": url,
+                        "body": body[:500000]
+                    })
+        except Exception:
+            pass
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=10, max=60),
+        retry=retry_if_exception_type((TimeoutError, Exception)),
+        reraise=True
+    )
+    def collect_price(self, url: str) -> dict:
+        """Сбор цены для одного URL"""
+        result = {
+            "price": None,
+            "old_price": None,
+            "card_price": None,
+            "in_stock": True,
+            "raw_json": "",
+            "error": "",
+        }
+        
+        self.captured_responses = []
+        
+        with sync_playwright() as p:
+            # Настройки прокси
+            proxy_config = None
+            if PROXY_URL:
+                proxy_config = {"server": PROXY_URL}
+            
+            # Запуск реального браузера (не headless благодаря Xvfb)
+            self.context = p.chromium.launch_persistent_context(
+                user_data_dir=self.storage_path,
+                headless=False,  # Реальный браузер через Xvfb
+                viewport={"width": 1920, "height": 1080},
+                user_agent=ua.random,
+                proxy=proxy_config,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                ]
+            )
+            
+            try:
+                page = self.context.new_page()
+                
+                # Применяем stealth патчи
+                stealth_sync(page)
+                
+                # Перехват ответов
+                page.on("response", self._on_response)
+                
+                # Сначала заходим на главную (как реальный пользователь)
+                logger.info(f"Открываем главную...")
+                page.goto("https://www.ozon.ru/", wait_until="domcontentloaded", timeout=30000)
+                time.sleep(random.uniform(2, 4))
+                human_scroll(page)
+                
+                # Теперь целевая страница
+                logger.info(f"Переходим на товар: {url}")
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                
+                # Ждём загрузки контента
+                time.sleep(random.uniform(3, 5))
+                human_scroll(page)
+                time.sleep(random.uniform(1, 2))
+                
+                # 1. Пробуем извлечь из перехваченных JSON
+                for item in reversed(self.captured_responses):
+                    prices = extract_prices_from_json(item["body"])
+                    if prices["price"]:
+                        result.update(prices)
+                        result["raw_json"] = json.dumps({
+                            "source": item["url"][:200],
+                            "prices": prices
+                        }, ensure_ascii=False)
+                        logger.info(f"Цена из API: {result['price']/100:.2f} ₽")
+                        break
+                
+                # 2. Fallback на DOM
+                if not result["price"]:
+                    logger.info("API не дал цену, пробуем DOM...")
+                    dom_result = extract_price_from_dom(page)
+                    result.update(dom_result)
+                    if result["price"]:
+                        logger.info(f"Цена из DOM: {result['price']/100:.2f} ₽")
+                
+                if not result["price"] and result["in_stock"]:
+                    result["error"] = "price_not_found"
+                    logger.warning("Цена не найдена")
+                
+            except Exception as e:
+                result["error"] = f"scrape_error: {str(e)[:200]}"
+                logger.error(f"Ошибка: {e}")
+                raise
+            
+            finally:
+                self.context.close()
+        
+        return result
+
+
+def run_collect(db: Session, run_id: int, storage_path: str):
+    """Запуск сбора цен для всех активных целей"""
+    from .models import Run
+    
+    targets = db.query(Target).filter(Target.enabled == True).all()
+    run = db.query(Run).filter(Run.id == run_id).first()
+    
+    if run:
+        run.total_targets = len(targets)
+        db.commit()
+    
+    scraper = OzonScraper(storage_path)
+    success_count = 0
+    fail_count = 0
+    
+    for i, target in enumerate(targets):
+        logger.info(f"[{i+1}/{len(targets)}] Обрабатываем: {target.name or target.url[:50]}")
+        
+        try:
+            data = scraper.collect_price(target.url)
+            
+            pp = PricePoint(
+                run_id=run_id,
+                target_id=target.id,
+                price=data["price"],
+                old_price=data["old_price"],
+                card_price=data["card_price"],
+                in_stock=data["in_stock"],
+                collected_at=datetime.utcnow(),
+                raw_json=data["raw_json"],
+                error=data["error"],
+            )
+            db.add(pp)
+            db.commit()
+            
+            if data["price"]:
+                success_count += 1
+            else:
+                fail_count += 1
+        
+        except Exception as e:
+            logger.error(f"Критическая ошибка для {target.url}: {e}")
+            pp = PricePoint(
+                run_id=run_id,
+                target_id=target.id,
+                in_stock=True,
+                collected_at=datetime.utcnow(),
+                error=f"critical_error: {str(e)[:200]}",
+            )
+            db.add(pp)
+            db.commit()
+            fail_count += 1
+        
+        # Задержка между запросами (кроме последнего)
+        if i < len(targets) - 1:
+            random_delay()
+    
+    # Обновляем статистику run
+    if run:
+        run.success_count = success_count
+        run.fail_count = fail_count
+        db.commit()
+    
+    logger.info(f"Завершено: {success_count} успешно, {fail_count} с ошибками")

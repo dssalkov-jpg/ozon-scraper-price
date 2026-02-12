@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+data/app.db
+data/regions/*
+!data/.gitkeep
+playwright/.cache/
+.venv/

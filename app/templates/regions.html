@@ -1,0 +1,47 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>🌍 Regions / ПВЗ профили</h2>
+
+<div class="card">
+  <h3>Создать профиль региона</h3>
+  <form method="post" action="/regions/add">
+    <div class="form-group">
+      <label>Название профиля</label>
+      <input name="name" placeholder="moscow_center" required/>
+    </div>
+    <button type="submit">➕ Создать</button>
+  </form>
+  <p class="muted" style="margin-top:16px">
+    <strong>Как настроить ПВЗ:</strong><br>
+    1. Создай профиль здесь<br>
+    2. Локально запусти: <code>python scripts/create_region_profile.py название_профиля</code><br>
+    3. В открывшемся браузере выбери ПВЗ/город и закрой окно<br>
+    4. Скопируй папку <code>data/regions/название_профиля</code> на сервер
+  </p>
+</div>
+
+{% if regions %}
+<table>
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Название</th>
+      <th>Путь</th>
+      <th>Обновлён</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in regions %}
+    <tr>
+      <td>{{r.id}}</td>
+      <td><strong>{{r.name}}</strong></td>
+      <td class="muted">{{r.storage_path}}</td>
+      <td class="muted">{{r.updated_at.strftime('%Y-%m-%d %H:%M') if r.updated_at else '—'}}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="card muted">Нет профилей регионов</div>
+{% endif %}
+{% endblock %}
