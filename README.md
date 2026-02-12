@@ -169,3 +169,4 @@ docker compose logs | grep Xvfb
 ## Лицензия
 
 MIT
+# deploy test Thu Feb 12 10:55:03 UTC 2026
