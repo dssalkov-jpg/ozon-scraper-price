@@ -154,7 +154,6 @@ def extract_price_from_dom(page: Page) -> dict:
 class OzonScraper:
     def __init__(self, storage_path: str):
         self.storage_path = storage_path
-        self.context: Optional[BrowserContext] = None
         self.captured_responses: list = []
     
     def _on_response(self, response):
@@ -194,103 +193,92 @@ class OzonScraper:
         if PROXY_URL:
             proxy_config = {"server": PROXY_URL}
         
+        browser = None
+        context = None
+        
         try:
             with sync_playwright() as p:
-                # Проверяем, существует ли профиль и валиден ли он
-                use_persistent = os.path.exists(self.storage_path) and \
-                                 os.path.exists(os.path.join(self.storage_path, "Default"))
-                
                 browser_args = [
                     "--disable-blink-features=AutomationControlled",
                     "--disable-dev-shm-usage",
                     "--no-sandbox",
                     "--disable-gpu",
                     "--disable-setuid-sandbox",
+                    "--disable-software-rasterizer",
+                    "--disable-extensions",
                 ]
                 
-                if use_persistent:
-                    logger.info(f"Используем профиль: {self.storage_path}")
-                    self.context = p.chromium.launch_persistent_context(
-                        user_data_dir=self.storage_path,
-                        headless=True,  # Пробуем headless для стабильности
-                        viewport={"width": 1920, "height": 1080},
-                        user_agent=ua.random,
-                        proxy=proxy_config,
-                        args=browser_args,
-                    )
-                else:
-                    logger.info("Профиль не найден, используем чистый браузер")
-                    browser = p.chromium.launch(
-                        headless=True,
-                        args=browser_args,
-                    )
-                    self.context = browser.new_context(
-                        viewport={"width": 1920, "height": 1080},
-                        user_agent=ua.random,
-                        proxy=proxy_config,
-                    )
+                logger.info("Запускаем браузер...")
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=browser_args,
+                )
                 
-                try:
-                    page = self.context.new_page()
-                    
-                    # Применяем stealth патчи
-                    stealth_sync(page)
-                    
-                    # Перехват ответов
-                    page.on("response", self._on_response)
-                    
-                    # Сначала заходим на главную (как реальный пользователь)
-                    logger.info("Открываем главную...")
-                    page.goto("https://www.ozon.ru/", wait_until="domcontentloaded", timeout=45000)
-                    time.sleep(random.uniform(2, 4))
-                    human_scroll(page)
-                    
-                    # Теперь целевая страница
-                    logger.info(f"Переходим на товар: {url[:80]}...")
-                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    
-                    # Ждём загрузки контента
-                    time.sleep(random.uniform(3, 6))
-                    human_scroll(page)
-                    time.sleep(random.uniform(1, 2))
-                    
-                    # 1. Пробуем извлечь из перехваченных JSON
-                    for item in reversed(self.captured_responses):
-                        prices = extract_prices_from_json(item["body"])
-                        if prices["price"]:
-                            result.update(prices)
-                            result["raw_json"] = json.dumps({
-                                "source": item["url"][:200],
-                                "prices": prices
-                            }, ensure_ascii=False)
-                            logger.info(f"Цена из API: {result['price']/100:.2f} ₽")
-                            break
-                    
-                    # 2. Fallback на DOM
-                    if not result["price"]:
-                        logger.info("API не дал цену, пробуем DOM...")
-                        dom_result = extract_price_from_dom(page)
-                        result.update(dom_result)
-                        if result["price"]:
-                            logger.info(f"Цена из DOM: {result['price']/100:.2f} ₽")
-                    
-                    if not result["price"] and result["in_stock"]:
-                        result["error"] = "price_not_found"
-                        logger.warning("Цена не найдена")
-                    
-                except Exception as e:
-                    result["error"] = f"scrape_error: {str(e)[:200]}"
-                    logger.error(f"Ошибка при скрапинге: {e}")
+                context = browser.new_context(
+                    viewport={"width": 1920, "height": 1080},
+                    user_agent=ua.random,
+                    proxy=proxy_config,
+                )
                 
-                finally:
-                    try:
-                        self.context.close()
-                    except Exception:
-                        pass
-        
+                page = context.new_page()
+                
+                # Применяем stealth патчи
+                stealth_sync(page)
+                
+                # Перехват ответов
+                page.on("response", self._on_response)
+                
+                # Сначала заходим на главную (как реальный пользователь)
+                logger.info("Открываем главную...")
+                page.goto("https://www.ozon.ru/", wait_until="domcontentloaded", timeout=45000)
+                time.sleep(random.uniform(2, 4))
+                human_scroll(page)
+                
+                # Теперь целевая страница
+                logger.info(f"Переходим на товар: {url[:80]}...")
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                
+                # Ждём загрузки контента
+                time.sleep(random.uniform(3, 6))
+                human_scroll(page)
+                time.sleep(random.uniform(1, 2))
+                
+                # 1. Пробуем извлечь из перехваченных JSON
+                for item in reversed(self.captured_responses):
+                    prices = extract_prices_from_json(item["body"])
+                    if prices["price"]:
+                        result.update(prices)
+                        result["raw_json"] = json.dumps({
+                            "source": item["url"][:200],
+                            "prices": prices
+                        }, ensure_ascii=False)
+                        logger.info(f"Цена из API: {result['price']/100:.2f} ₽")
+                        break
+                
+                # 2. Fallback на DOM
+                if not result["price"]:
+                    logger.info("API не дал цену, пробуем DOM...")
+                    dom_result = extract_price_from_dom(page)
+                    result.update(dom_result)
+                    if result["price"]:
+                        logger.info(f"Цена из DOM: {result['price']/100:.2f} ₽")
+                
+                if not result["price"] and result["in_stock"]:
+                    result["error"] = "price_not_found"
+                    logger.warning("Цена не найдена")
+                    
         except Exception as e:
             result["error"] = f"browser_error: {str(e)[:200]}"
-            logger.error(f"Ошибка запуска браузера: {e}")
+            logger.error(f"Ошибка: {e}")
+        
+        finally:
+            try:
+                if context:
+                    context.close()
+                if browser:
+                    browser.close()
+            except Exception:
+                pass
         
         return result
 
