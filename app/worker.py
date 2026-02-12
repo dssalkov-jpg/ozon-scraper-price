@@ -238,7 +238,18 @@ class OzonScraper:
                 logger.info(f"Переходим на товар: {url[:80]}...")
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
-                # Ждём загрузки контента
+                # Ждём появления элемента с ценой или контентом товара
+                logger.info("Ожидаем загрузки страницы товара...")
+                try:
+                    page.wait_for_selector(
+                        "[data-widget='webPrice'], [data-widget='webSale'], [data-widget='webProductHeading'], span:has-text('₽')",
+                        timeout=15000
+                    )
+                    logger.info("Контент загружен")
+                except Exception as wait_err:
+                    logger.warning(f"Таймаут ожидания контента: {wait_err}")
+                
+                # Дополнительная пауза для подгрузки динамического контента
                 time.sleep(random.uniform(3, 6))
                 human_scroll(page)
                 time.sleep(random.uniform(1, 2))
