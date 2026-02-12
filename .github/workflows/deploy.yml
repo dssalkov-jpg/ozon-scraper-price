@@ -9,21 +9,12 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Debug secrets presence
-        run: |
-          echo "HOST_len=${#VPS_HOST}"
-          echo "USER_len=${#VPS_USER}"
-          echo "KEY_len=${#VPS_SSH_KEY}"
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
-
       - name: SSH deploy
         uses: appleboy/ssh-action@v1
         with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
+          host: 109.73.192.175
+          username: root
           key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
           script: |
             /usr/local/bin/deploy_ozon.sh
