@@ -264,7 +264,15 @@ class OzonScraper:
                         logger.info(f"Цена из DOM: {result['price']/100:.2f} ₽")
                 
                 if not result["price"] and result["in_stock"]:
-                    result["error"] = "price_not_found"
+                    # Сохраняем скриншот для отладки
+                    try:
+                        screenshot_path = f"./data/debug_{int(time.time())}.png"
+                        page.screenshot(path=screenshot_path, full_page=True)
+                        logger.info(f"Скриншот сохранён: {screenshot_path}")
+                        result["error"] = f"price_not_found (screenshot: {screenshot_path})"
+                    except Exception as ss_err:
+                        logger.warning(f"Не удалось сохранить скриншот: {ss_err}")
+                        result["error"] = "price_not_found"
                     logger.warning("Цена не найдена")
                     
         except Exception as e:
