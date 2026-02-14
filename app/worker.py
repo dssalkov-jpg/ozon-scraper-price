@@ -206,12 +206,13 @@ class OzonScraper:
                     "--disable-software-rasterizer",
                 ]
                 
-                logger.info("Запускаем браузер с persistent context...")
+                logger.info("Запускаем браузер с persistent context (Xvfb)...")
                 
                 # Используем persistent context для сохранения cookies/state
+                # headless=False + Xvfb = реальный браузер на виртуальном дисплее
                 context = p.chromium.launch_persistent_context(
                     user_data_dir=self.storage_path,
-                    headless=True,
+                    headless=False,  # Важно! Реальный браузер через Xvfb
                     args=browser_args,
                     viewport={"width": 1920, "height": 1080},
                     user_agent=ua.random,
