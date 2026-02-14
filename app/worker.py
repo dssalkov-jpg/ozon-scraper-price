@@ -193,7 +193,6 @@ class OzonScraper:
         if PROXY_URL:
             proxy_config = {"server": PROXY_URL}
         
-        browser = None
         context = None
         
         try:
@@ -205,19 +204,20 @@ class OzonScraper:
                     "--disable-gpu",
                     "--disable-setuid-sandbox",
                     "--disable-software-rasterizer",
-                    "--disable-extensions",
                 ]
                 
-                logger.info("Запускаем браузер...")
-                browser = p.chromium.launch(
+                logger.info("Запускаем браузер с persistent context...")
+                
+                # Используем persistent context для сохранения cookies/state
+                context = p.chromium.launch_persistent_context(
+                    user_data_dir=self.storage_path,
                     headless=True,
                     args=browser_args,
-                )
-                
-                context = browser.new_context(
                     viewport={"width": 1920, "height": 1080},
                     user_agent=ua.random,
                     proxy=proxy_config,
+                    locale="ru-RU",
+                    timezone_id="Europe/Moscow",
                 )
                 
                 page = context.new_page()
@@ -230,20 +230,43 @@ class OzonScraper:
                 
                 # Сначала заходим на главную (как реальный пользователь)
                 logger.info("Открываем главную...")
-                page.goto("https://www.ozon.ru/", wait_until="domcontentloaded", timeout=45000)
-                time.sleep(random.uniform(2, 4))
+                page.goto("https://www.ozon.ru/", wait_until="domcontentloaded", timeout=60000)
+                
+                # Ждём прохождения challenge (если есть)
+                logger.info("Проверяем наличие challenge...")
+                time.sleep(random.uniform(3, 5))
+                
+                # Если видим challenge, ждём дольше
+                for attempt in range(3):
+                    if "fab_chlg" in page.content() or page.locator("text=Подождите").count() > 0:
+                        logger.info(f"Challenge обнаружен, ждём... (попытка {attempt + 1})")
+                        time.sleep(random.uniform(8, 12))
+                        human_scroll(page)
+                    else:
+                        break
+                
                 human_scroll(page)
+                time.sleep(random.uniform(2, 4))
                 
                 # Теперь целевая страница
                 logger.info(f"Переходим на товар: {url[:80]}...")
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                
+                # Проверяем challenge на странице товара
+                time.sleep(random.uniform(2, 4))
+                for attempt in range(3):
+                    if "fab_chlg" in page.content() or page.locator("text=Подождите").count() > 0:
+                        logger.info(f"Challenge на странице товара, ждём... (попытка {attempt + 1})")
+                        time.sleep(random.uniform(8, 12))
+                    else:
+                        break
                 
                 # Ждём появления элемента с ценой или контентом товара
                 logger.info("Ожидаем загрузки страницы товара...")
                 try:
                     page.wait_for_selector(
                         "[data-widget='webPrice'], [data-widget='webSale'], [data-widget='webProductHeading'], span:has-text('₽')",
-                        timeout=15000
+                        timeout=20000
                     )
                     logger.info("Контент загружен")
                 except Exception as wait_err:
@@ -294,8 +317,6 @@ class OzonScraper:
             try:
                 if context:
                     context.close()
-                if browser:
-                    browser.close()
             except Exception:
                 pass
         
