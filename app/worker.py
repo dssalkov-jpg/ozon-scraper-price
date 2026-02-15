@@ -1,10 +1,7 @@
 """
-Улучшенный worker для парсинга цен с Ozon.
-- Playwright Stealth для обхода детекции
-- Реальный браузер через Xvfb (не headless)
-- Человекоподобное поведение
-- Retry с exponential backoff
-- Точное извлечение цен из JSON API
+Worker для парсинга цен с Ozon через ZenRows API.
+- ZenRows обходит защиту Ozon (JS render + premium proxy)
+- Простые HTTP запросы вместо браузера
 """
 
 import re
@@ -14,35 +11,24 @@ import time
 import os
 import logging
 from datetime import datetime
-from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import quote_plus
 
-from playwright.sync_api import sync_playwright, Page, BrowserContext
-from playwright_stealth import stealth_sync
-from fake_useragent import UserAgent
+import requests
 from sqlalchemy.orm import Session
-
-try:
-    from anticaptchaofficial.turnstileproxyless import turnstileProxyless
-except ImportError:
-    turnstileProxyless = None
 
 from .models import Target, PricePoint
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Настройки задержек
-MIN_DELAY = int(os.getenv("MIN_DELAY_SECONDS", "45"))
-MAX_DELAY = int(os.getenv("MAX_DELAY_SECONDS", "120"))
-PROXY_URL = os.getenv("PROXY_URL", "")
-ANTICAPTCHA_API_KEY = os.getenv("ANTICAPTCHA_API_KEY", "")
-
-ua = UserAgent(browsers=["chrome"])
+# Настройки
+MIN_DELAY = int(os.getenv("MIN_DELAY_SECONDS", "5"))
+MAX_DELAY = int(os.getenv("MAX_DELAY_SECONDS", "15"))
+ZENROWS_API_KEY = os.getenv("ZENROWS_API_KEY", "")
 
 
 def random_delay(min_sec: float = None, max_sec: float = None):
-    """Случайная задержка между действиями"""
+    """Случайная задержка между запросами"""
     min_sec = min_sec or MIN_DELAY
     max_sec = max_sec or MAX_DELAY
     delay = random.uniform(min_sec, max_sec)
@@ -50,211 +36,73 @@ def random_delay(min_sec: float = None, max_sec: float = None):
     time.sleep(delay)
 
 
-def human_scroll(page: Page):
-    """Имитация человеческого скролла"""
-    for _ in range(random.randint(2, 4)):
-        scroll_amount = random.randint(200, 500)
-        page.mouse.wheel(0, scroll_amount)
-        time.sleep(random.uniform(0.3, 0.8))
-
-
-def extract_prices_from_json(json_str: str) -> dict:
+def extract_price_from_html(html: str) -> dict:
     """
-    Извлекает цены из JSON ответа Ozon API.
-    Ищет структуры вида: price, finalPrice, cardPrice, originalPrice
+    Извлекает цены из HTML страницы Ozon.
+    Ищет JSON-данные в HTML: "price":"1629" и подобные паттерны.
     """
-    result = {"price": None, "old_price": None, "card_price": None}
-    
-    try:
-        data = json.loads(json_str)
-    except json.JSONDecodeError:
-        return result
-    
-    def search_prices(obj, depth=0):
-        if depth > 15 or result["price"] is not None:
-            return
-        
-        if isinstance(obj, dict):
-            # Ищем типичные структуры цен Ozon
-            for key in ["price", "finalPrice", "salePrice", "minPrice"]:
-                if key in obj and result["price"] is None:
-                    val = obj[key]
-                    if isinstance(val, (int, float)) and val > 0:
-                        result["price"] = int(val * 100) if val < 1000000 else int(val)
-                    elif isinstance(val, str):
-                        cleaned = re.sub(r"[^\d]", "", val)
-                        if cleaned:
-                            result["price"] = int(cleaned) * 100
-            
-            for key in ["originalPrice", "basePrice", "oldPrice"]:
-                if key in obj and result["old_price"] is None:
-                    val = obj[key]
-                    if isinstance(val, (int, float)) and val > 0:
-                        result["old_price"] = int(val * 100) if val < 1000000 else int(val)
-                    elif isinstance(val, str):
-                        cleaned = re.sub(r"[^\d]", "", val)
-                        if cleaned:
-                            result["old_price"] = int(cleaned) * 100
-            
-            for key in ["cardPrice", "ozonCardPrice"]:
-                if key in obj and result["card_price"] is None:
-                    val = obj[key]
-                    if isinstance(val, (int, float)) and val > 0:
-                        result["card_price"] = int(val * 100) if val < 1000000 else int(val)
-            
-            for v in obj.values():
-                search_prices(v, depth + 1)
-        
-        elif isinstance(obj, list):
-            for item in obj[:10]:  # Ограничиваем глубину
-                search_prices(item, depth + 1)
-    
-    search_prices(data)
-    return result
-
-
-def check_and_handle_access_block(page: Page) -> bool:
-    """
-    Проверяет наличие страницы "Доступ ограничен" и пытается обойти.
-    Возвращает True, если блокировка обнаружена и обработана.
-    """
-    content = page.content()
-    
-    # Проверяем признаки блокировки
-    is_blocked = (
-        "Доступ ограничен" in content or
-        "Access denied" in content or
-        page.locator("text=Доступ ограничен").count() > 0
-    )
-    
-    if not is_blocked:
-        return False
-        
-    logger.warning("Обнаружена страница 'Доступ ограничен'")
-    
-    # Сначала пробуем просто подождать (для Cloudflare challenge)
-    logger.info("Ожидание автоматического прохождения challenge...")
-    
-    for wait_attempt in range(6):
-        # Увеличенные задержки: 15-30 секунд на каждую попытку
-        wait_time = random.uniform(15, 30)
-        logger.info(f"Ожидание {wait_time:.1f} сек (попытка {wait_attempt + 1}/6)...")
-        time.sleep(wait_time)
-        human_scroll(page)
-        
-        # Проверяем, прошла ли блокировка
-        content = page.content()
-        if "Доступ ограничен" not in content and "Access denied" not in content:
-            logger.info("Блокировка прошла автоматически!")
-            return True
-            
-        logger.info(f"Попытка {wait_attempt + 1}/6: блокировка всё ещё активна")
-    
-    # Если автоматически не прошла, пробуем Anti-Captcha
-    if ANTICAPTCHA_API_KEY and turnstileProxyless:
-        logger.info("Пробуем решить challenge через Anti-Captcha...")
-        try:
-            # Ищем Turnstile/Cloudflare widget
-            # Для Ozon это может быть скрытый challenge
-            current_url = page.url
-            
-            solver = turnstileProxyless()
-            solver.set_verbose(1)
-            solver.set_key(ANTICAPTCHA_API_KEY)
-            solver.set_website_url(current_url)
-            solver.set_website_key("0x4AAAAAAAC3DHQFLr1GavRN")  # Обычный sitekey для Cloudflare Turnstile
-            
-            token = solver.solve_and_return_solution()
-            
-            if token:
-                logger.info("Решение получено от Anti-Captcha")
-                # Обновляем страницу
-                page.reload(wait_until="domcontentloaded")
-                time.sleep(random.uniform(3, 5))
-                return True
-            else:
-                logger.warning(f"Anti-Captcha не смог решить: {solver.error_code}")
-        except Exception as e:
-            logger.error(f"Ошибка Anti-Captcha: {e}")
-    else:
-        if not ANTICAPTCHA_API_KEY:
-            logger.warning("Не указан ANTICAPTCHA_API_KEY в .env")
-    
-    logger.warning("Не удалось обойти блокировку")
-    return True  # Возвращаем True, чтобы указать, что блокировка была
-
-
-def extract_price_from_dom(page: Page) -> dict:
-    """Fallback: извлечение цены из DOM"""
     result = {"price": None, "old_price": None, "card_price": None, "in_stock": True}
     
-    try:
-        # Проверяем наличие товара
-        out_of_stock_selectors = [
-            "text=Нет в наличии",
-            "text=Товар закончился",
-            "[data-widget='webOutOfStock']"
-        ]
-        for sel in out_of_stock_selectors:
-            if page.locator(sel).count() > 0:
-                result["in_stock"] = False
-                return result
-        
-        # Ищем цену в типичных местах
-        price_selectors = [
-            "[data-widget='webPrice'] span:has-text('₽')",
-            "[data-widget='webSale'] span:has-text('₽')",
-            ".price-block span:has-text('₽')",
-        ]
-        
-        for sel in price_selectors:
-            elements = page.locator(sel).all()
-            for el in elements[:3]:
-                text = el.inner_text()
-                # Убираем все кроме цифр
-                cleaned = re.sub(r"[^\d]", "", text)
-                if cleaned and len(cleaned) >= 2:
-                    price_val = int(cleaned) * 100  # в копейки
-                    if result["price"] is None:
-                        result["price"] = price_val
-                    elif price_val > result["price"]:
-                        result["old_price"] = price_val
-                    break
-            if result["price"]:
-                break
+    # Проверяем наличие товара
+    if "Нет в наличии" in html or "Товар закончился" in html or "webOutOfStock" in html:
+        result["in_stock"] = False
+        return result
     
-    except Exception as e:
-        logger.warning(f"DOM extraction error: {e}")
+    # Ищем цену в JSON-данных внутри HTML
+    # Паттерн: "price":"1629" или "price":1629
+    price_patterns = [
+        r'"price"\s*:\s*"?(\d+)"?',
+        r'"finalPrice"\s*:\s*"?(\d+)"?',
+        r'"salePrice"\s*:\s*"?(\d+)"?',
+    ]
+    
+    for pattern in price_patterns:
+        match = re.search(pattern, html)
+        if match:
+            price_val = int(match.group(1))
+            # Цена в рублях, конвертируем в копейки
+            result["price"] = price_val * 100
+            logger.info(f"Найдена цена: {price_val} ₽")
+            break
+    
+    # Ищем старую цену
+    old_price_patterns = [
+        r'"originalPrice"\s*:\s*"?(\d+)"?',
+        r'"basePrice"\s*:\s*"?(\d+)"?',
+        r'"oldPrice"\s*:\s*"?(\d+)"?',
+    ]
+    
+    for pattern in old_price_patterns:
+        match = re.search(pattern, html)
+        if match:
+            result["old_price"] = int(match.group(1)) * 100
+            break
+    
+    # Ищем цену по карте Ozon
+    card_price_patterns = [
+        r'"cardPrice"\s*:\s*"?(\d+)"?',
+        r'"ozonCardPrice"\s*:\s*"?(\d+)"?',
+    ]
+    
+    for pattern in card_price_patterns:
+        match = re.search(pattern, html)
+        if match:
+            result["card_price"] = int(match.group(1)) * 100
+            break
     
     return result
 
 
 class OzonScraper:
-    def __init__(self, storage_path: str):
+    def __init__(self, storage_path: str = None):
+        # storage_path не используется с ZenRows, но оставляем для совместимости
         self.storage_path = storage_path
-        self.captured_responses: list = []
-    
-    def _on_response(self, response):
-        """Перехват JSON ответов"""
-        try:
-            ct = response.headers.get("content-type", "")
-            url = response.url
-            
-            # Ловим API ответы с данными о товаре
-            if "application/json" in ct and any(x in url for x in [
-                "/api/", "/v1/", "/v2/", "state.json", "webPrice", "webSale"
-            ]):
-                body = response.text()
-                if '"price"' in body or '"finalPrice"' in body or '"Price"' in body:
-                    self.captured_responses.append({
-                        "url": url,
-                        "body": body[:500000]
-                    })
-        except Exception:
-            pass
+        
+        if not ZENROWS_API_KEY:
+            raise ValueError("ZENROWS_API_KEY не установлен в .env")
     
     def collect_price(self, url: str) -> dict:
-        """Сбор цены для одного URL"""
+        """Сбор цены для одного URL через ZenRows API"""
         result = {
             "price": None,
             "old_price": None,
@@ -264,137 +112,66 @@ class OzonScraper:
             "error": "",
         }
         
-        self.captured_responses = []
-        
-        # Настройки прокси
-        proxy_config = None
-        if PROXY_URL:
-            # Парсим URL прокси для извлечения credentials
-            parsed = urlparse(PROXY_URL)
-            if parsed.username and parsed.password:
-                proxy_config = {
-                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
-                    "username": parsed.username,
-                    "password": parsed.password,
-                }
-                logger.info(f"Используем прокси: {parsed.hostname}:{parsed.port}")
-            else:
-                proxy_config = {"server": PROXY_URL}
-                logger.info(f"Используем прокси без авторизации: {PROXY_URL}")
-        
-        context = None
-        
         try:
-            with sync_playwright() as p:
-                browser_args = [
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--disable-setuid-sandbox",
-                    "--disable-software-rasterizer",
-                ]
+            # Формируем URL для ZenRows API
+            # js_render=true - рендеринг JavaScript
+            # premium_proxy=true - премиум прокси
+            # proxy_country=ru - прокси из России
+            # wait_for - ждём появления элемента с ценой
+            # wait - максимальное время ожидания в мс
+            encoded_url = quote_plus(url)
+            wait_selector = quote_plus("[data-widget='webPrice']")
+            
+            zenrows_url = (
+                f"https://api.zenrows.com/v1/"
+                f"?apikey={ZENROWS_API_KEY}"
+                f"&url={encoded_url}"
+                f"&js_render=true"
+                f"&premium_proxy=true"
+                f"&proxy_country=ru"
+                f"&wait_for={wait_selector}"
+                f"&wait=5000"
+            )
+            
+            logger.info(f"Запрос к ZenRows: {url[:60]}...")
+            
+            response = requests.get(zenrows_url, timeout=60)
+            
+            if response.status_code != 200:
+                result["error"] = f"zenrows_error: HTTP {response.status_code}"
+                logger.error(f"ZenRows вернул {response.status_code}: {response.text[:200]}")
+                return result
+            
+            html = response.text
+            
+            # Проверяем, не заблокировали ли нас
+            if "Доступ ограничен" in html or "Access denied" in html:
+                result["error"] = "access_blocked"
+                logger.warning("Ozon заблокировал доступ")
+                return result
+            
+            # Извлекаем цены
+            prices = extract_price_from_html(html)
+            result.update(prices)
+            
+            if result["price"]:
+                logger.info(f"Цена: {result['price']/100:.2f} ₽")
+                result["raw_json"] = json.dumps({
+                    "source": "zenrows",
+                    "price": result["price"],
+                    "old_price": result["old_price"],
+                    "card_price": result["card_price"],
+                }, ensure_ascii=False)
+            else:
+                result["error"] = "price_not_found"
+                logger.warning("Цена не найдена в HTML")
                 
-                logger.info("Запускаем браузер с persistent context (Xvfb)...")
-                
-                # Используем persistent context для сохранения cookies/state
-                # headless=False + Xvfb = реальный браузер на виртуальном дисплее
-                context = p.chromium.launch_persistent_context(
-                    user_data_dir=self.storage_path,
-                    headless=False,  # Важно! Реальный браузер через Xvfb
-                    args=browser_args,
-                    viewport={"width": 1920, "height": 1080},
-                    user_agent=ua.random,
-                    proxy=proxy_config,
-                    locale="ru-RU",
-                    timezone_id="Europe/Moscow",
-                )
-                
-                page = context.new_page()
-                
-                # Применяем stealth патчи
-                stealth_sync(page)
-                
-                # Перехват ответов
-                page.on("response", self._on_response)
-                
-                # Сначала заходим на главную (как реальный пользователь)
-                logger.info("Открываем главную...")
-                page.goto("https://www.ozon.ru/", wait_until="domcontentloaded", timeout=60000)
-                
-                # Проверяем и обрабатываем блокировку
-                time.sleep(random.uniform(3, 5))
-                check_and_handle_access_block(page)
-                
-                human_scroll(page)
-                time.sleep(random.uniform(2, 4))
-                
-                # Теперь целевая страница
-                logger.info(f"Переходим на товар: {url[:80]}...")
-                page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                
-                # Проверяем и обрабатываем блокировку на странице товара
-                time.sleep(random.uniform(2, 4))
-                check_and_handle_access_block(page)
-                
-                # Ждём появления элемента с ценой или контентом товара
-                logger.info("Ожидаем загрузки страницы товара...")
-                try:
-                    page.wait_for_selector(
-                        "[data-widget='webPrice'], [data-widget='webSale'], [data-widget='webProductHeading'], span:has-text('₽')",
-                        timeout=20000
-                    )
-                    logger.info("Контент загружен")
-                except Exception as wait_err:
-                    logger.warning(f"Таймаут ожидания контента: {wait_err}")
-                
-                # Дополнительная пауза для подгрузки динамического контента
-                time.sleep(random.uniform(3, 6))
-                human_scroll(page)
-                time.sleep(random.uniform(1, 2))
-                
-                # 1. Пробуем извлечь из перехваченных JSON
-                for item in reversed(self.captured_responses):
-                    prices = extract_prices_from_json(item["body"])
-                    if prices["price"]:
-                        result.update(prices)
-                        result["raw_json"] = json.dumps({
-                            "source": item["url"][:200],
-                            "prices": prices
-                        }, ensure_ascii=False)
-                        logger.info(f"Цена из API: {result['price']/100:.2f} ₽")
-                        break
-                
-                # 2. Fallback на DOM
-                if not result["price"]:
-                    logger.info("API не дал цену, пробуем DOM...")
-                    dom_result = extract_price_from_dom(page)
-                    result.update(dom_result)
-                    if result["price"]:
-                        logger.info(f"Цена из DOM: {result['price']/100:.2f} ₽")
-                
-                if not result["price"] and result["in_stock"]:
-                    # Сохраняем скриншот для отладки
-                    try:
-                        screenshot_path = f"./data/debug_{int(time.time())}.png"
-                        page.screenshot(path=screenshot_path, full_page=True)
-                        logger.info(f"Скриншот сохранён: {screenshot_path}")
-                        result["error"] = f"price_not_found (screenshot: {screenshot_path})"
-                    except Exception as ss_err:
-                        logger.warning(f"Не удалось сохранить скриншот: {ss_err}")
-                        result["error"] = "price_not_found"
-                    logger.warning("Цена не найдена")
-                    
+        except requests.Timeout:
+            result["error"] = "timeout"
+            logger.error("Таймаут запроса к ZenRows")
         except Exception as e:
-            result["error"] = f"browser_error: {str(e)[:200]}"
+            result["error"] = f"error: {str(e)[:200]}"
             logger.error(f"Ошибка: {e}")
-        
-        finally:
-            try:
-                if context:
-                    context.close()
-            except Exception:
-                pass
         
         return result
 
