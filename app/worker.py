@@ -15,6 +15,7 @@ import os
 import logging
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright, Page, BrowserContext
 from playwright_stealth import stealth_sync
@@ -191,7 +192,18 @@ class OzonScraper:
         # Настройки прокси
         proxy_config = None
         if PROXY_URL:
-            proxy_config = {"server": PROXY_URL}
+            # Парсим URL прокси для извлечения credentials
+            parsed = urlparse(PROXY_URL)
+            if parsed.username and parsed.password:
+                proxy_config = {
+                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                    "username": parsed.username,
+                    "password": parsed.password,
+                }
+                logger.info(f"Используем прокси: {parsed.hostname}:{parsed.port}")
+            else:
+                proxy_config = {"server": PROXY_URL}
+                logger.info(f"Используем прокси без авторизации: {PROXY_URL}")
         
         context = None
         
