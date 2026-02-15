@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from datetime import datetime
 import os
@@ -13,6 +14,10 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Ozon Price Scraper")
 templates = Jinja2Templates(directory="app/templates")
+
+# Статические файлы
+os.makedirs("./data/static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="./data/static"), name="static")
 
 
 @app.on_event("startup")
