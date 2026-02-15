@@ -135,7 +135,7 @@ class OzonScraper:
             
             logger.info(f"Запрос к ZenRows: {url[:60]}...")
             
-            response = requests.get(zenrows_url, timeout=60)
+            response = requests.get(zenrows_url, timeout=120)
             
             if response.status_code != 200:
                 result["error"] = f"zenrows_error: HTTP {response.status_code}"
