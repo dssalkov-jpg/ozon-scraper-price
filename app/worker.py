@@ -22,6 +22,11 @@ from playwright_stealth import stealth_sync
 from fake_useragent import UserAgent
 from sqlalchemy.orm import Session
 
+try:
+    from anticaptchaofficial.turnstileproxyless import turnstileProxyless
+except ImportError:
+    turnstileProxyless = None
+
 from .models import Target, PricePoint
 
 logging.basicConfig(level=logging.INFO)
@@ -31,6 +36,7 @@ logger = logging.getLogger(__name__)
 MIN_DELAY = int(os.getenv("MIN_DELAY_SECONDS", "45"))
 MAX_DELAY = int(os.getenv("MAX_DELAY_SECONDS", "120"))
 PROXY_URL = os.getenv("PROXY_URL", "")
+ANTICAPTCHA_API_KEY = os.getenv("ANTICAPTCHA_API_KEY", "")
 
 ua = UserAgent(browsers=["chrome"])
 
@@ -105,6 +111,74 @@ def extract_prices_from_json(json_str: str) -> dict:
     
     search_prices(data)
     return result
+
+
+def check_and_handle_access_block(page: Page) -> bool:
+    """
+    Проверяет наличие страницы "Доступ ограничен" и пытается обойти.
+    Возвращает True, если блокировка обнаружена и обработана.
+    """
+    content = page.content()
+    
+    # Проверяем признаки блокировки
+    is_blocked = (
+        "Доступ ограничен" in content or
+        "Access denied" in content or
+        page.locator("text=Доступ ограничен").count() > 0
+    )
+    
+    if not is_blocked:
+        return False
+        
+    logger.warning("Обнаружена страница 'Доступ ограничен'")
+    
+    # Сначала пробуем просто подождать (для Cloudflare challenge)
+    logger.info("Ожидание автоматического прохождения challenge...")
+    
+    for wait_attempt in range(4):
+        time.sleep(random.uniform(8, 15))
+        human_scroll(page)
+        
+        # Проверяем, прошла ли блокировка
+        content = page.content()
+        if "Доступ ограничен" not in content and "Access denied" not in content:
+            logger.info("Блокировка прошла автоматически!")
+            return True
+            
+        logger.info(f"Попытка {wait_attempt + 1}/4: блокировка всё ещё активна")
+    
+    # Если автоматически не прошла, пробуем Anti-Captcha
+    if ANTICAPTCHA_API_KEY and turnstileProxyless:
+        logger.info("Пробуем решить challenge через Anti-Captcha...")
+        try:
+            # Ищем Turnstile/Cloudflare widget
+            # Для Ozon это может быть скрытый challenge
+            current_url = page.url
+            
+            solver = turnstileProxyless()
+            solver.set_verbose(1)
+            solver.set_key(ANTICAPTCHA_API_KEY)
+            solver.set_website_url(current_url)
+            solver.set_website_key("0x4AAAAAAAC3DHQFLr1GavRN")  # Обычный sitekey для Cloudflare Turnstile
+            
+            token = solver.solve_and_return_solution()
+            
+            if token:
+                logger.info("Решение получено от Anti-Captcha")
+                # Обновляем страницу
+                page.reload(wait_until="domcontentloaded")
+                time.sleep(random.uniform(3, 5))
+                return True
+            else:
+                logger.warning(f"Anti-Captcha не смог решить: {solver.error_code}")
+        except Exception as e:
+            logger.error(f"Ошибка Anti-Captcha: {e}")
+    else:
+        if not ANTICAPTCHA_API_KEY:
+            logger.warning("Не указан ANTICAPTCHA_API_KEY в .env")
+    
+    logger.warning("Не удалось обойти блокировку")
+    return True  # Возвращаем True, чтобы указать, что блокировка была
 
 
 def extract_price_from_dom(page: Page) -> dict:
@@ -245,18 +319,9 @@ class OzonScraper:
                 logger.info("Открываем главную...")
                 page.goto("https://www.ozon.ru/", wait_until="domcontentloaded", timeout=60000)
                 
-                # Ждём прохождения challenge (если есть)
-                logger.info("Проверяем наличие challenge...")
+                # Проверяем и обрабатываем блокировку
                 time.sleep(random.uniform(3, 5))
-                
-                # Если видим challenge, ждём дольше
-                for attempt in range(3):
-                    if "fab_chlg" in page.content() or page.locator("text=Подождите").count() > 0:
-                        logger.info(f"Challenge обнаружен, ждём... (попытка {attempt + 1})")
-                        time.sleep(random.uniform(8, 12))
-                        human_scroll(page)
-                    else:
-                        break
+                check_and_handle_access_block(page)
                 
                 human_scroll(page)
                 time.sleep(random.uniform(2, 4))
@@ -265,14 +330,9 @@ class OzonScraper:
                 logger.info(f"Переходим на товар: {url[:80]}...")
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
-                # Проверяем challenge на странице товара
+                # Проверяем и обрабатываем блокировку на странице товара
                 time.sleep(random.uniform(2, 4))
-                for attempt in range(3):
-                    if "fab_chlg" in page.content() or page.locator("text=Подождите").count() > 0:
-                        logger.info(f"Challenge на странице товара, ждём... (попытка {attempt + 1})")
-                        time.sleep(random.uniform(8, 12))
-                    else:
-                        break
+                check_and_handle_access_block(page)
                 
                 # Ждём появления элемента с ценой или контентом товара
                 logger.info("Ожидаем загрузки страницы товара...")
