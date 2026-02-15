@@ -135,8 +135,11 @@ def check_and_handle_access_block(page: Page) -> bool:
     # Сначала пробуем просто подождать (для Cloudflare challenge)
     logger.info("Ожидание автоматического прохождения challenge...")
     
-    for wait_attempt in range(4):
-        time.sleep(random.uniform(8, 15))
+    for wait_attempt in range(6):
+        # Увеличенные задержки: 15-30 секунд на каждую попытку
+        wait_time = random.uniform(15, 30)
+        logger.info(f"Ожидание {wait_time:.1f} сек (попытка {wait_attempt + 1}/6)...")
+        time.sleep(wait_time)
         human_scroll(page)
         
         # Проверяем, прошла ли блокировка
@@ -145,7 +148,7 @@ def check_and_handle_access_block(page: Page) -> bool:
             logger.info("Блокировка прошла автоматически!")
             return True
             
-        logger.info(f"Попытка {wait_attempt + 1}/4: блокировка всё ещё активна")
+        logger.info(f"Попытка {wait_attempt + 1}/6: блокировка всё ещё активна")
     
     # Если автоматически не прошла, пробуем Anti-Captcha
     if ANTICAPTCHA_API_KEY and turnstileProxyless:
