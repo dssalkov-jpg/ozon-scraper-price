@@ -45,4 +45,4 @@ COPY . .
 EXPOSE 8000
 
 # Запуск uvicorn через xvfb-run
-CMD ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24 -nolisten tcp", "uvicorn", "app.main:app", "--host=0.0.0.0", "--port=8000"]
+CMD ["sh", "-c", "xvfb-run -a -s '-screen 0 1920x1080x24 -nolisten tcp' uvicorn app.main:app --host=0.0.0.0 --port=8000"]
